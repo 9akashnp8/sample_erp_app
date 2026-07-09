@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+db/erp.db
+erp_app.zip
+.env
+.venv/
+*.egg-info/

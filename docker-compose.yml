@@ -1,0 +1,19 @@
+services:
+  erp-api:
+    build: .
+    container_name: sample-erp-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - erp-db-data:/app/db
+    environment:
+      - RESET_DB=0   # set to 1 (or run `docker compose run -e RESET_DB=1 erp-api`) to reseed
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  erp-db-data:
