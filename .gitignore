@@ -4,4 +4,3 @@ db/erp.db
 .env
 .venv/
 erp_app.zip
-certs

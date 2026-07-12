@@ -89,3 +89,74 @@ class ERPClient:
     def delete_employee(self, employee_id: str) -> None:
         """Hard delete — mainly for test cleanup. Prefer terminate_employee()."""
         self._request("DELETE", f"/employees/{employee_id}")
+
+    # ---------- Finance module ----------
+
+    def get_bank_accounts(self, employee_id: str) -> List[Dict[str, Any]]:
+        """List bank accounts for an employee. Only masked account numbers
+        are ever returned — the full number is never exposed by this API."""
+        return self._request("GET", "/finance/bank-accounts", params={"employee_id": employee_id})
+
+    def add_bank_account(self, employee_id: str, bank_name: str, account_holder_name: str,
+                          account_number: str, currency: str = "USD",
+                          iban: Optional[str] = None, swift_bic: Optional[str] = None,
+                          is_primary: bool = True) -> Dict[str, Any]:
+        """Add a bank account. account_number is masked + 'encrypted' server-side
+        and the raw value is never returned afterward."""
+        payload = {
+            "employee_id": employee_id, "bank_name": bank_name,
+            "account_holder_name": account_holder_name, "account_number": account_number,
+            "currency": currency, "iban": iban, "swift_bic": swift_bic,
+            "is_primary": is_primary,
+        }
+        return self._request("POST", "/finance/bank-accounts", json=payload)
+
+    def update_bank_account(self, account_id: int, **fields) -> Dict[str, Any]:
+        """Partial update of a bank account, e.g. update_bank_account(16, status='Inactive')."""
+        return self._request("PATCH", f"/finance/bank-accounts/{account_id}", json=fields)
+
+    def get_salary_info(self, employee_id: str) -> Dict[str, Any]:
+        """Fetch an employee's current gross salary record."""
+        return self._request("GET", f"/finance/salary/{employee_id}")
+
+    def set_salary_info(self, employee_id: str, gross_salary: float, currency: str,
+                         effective_date: str, pay_frequency: str = "Monthly") -> Dict[str, Any]:
+        """Create the initial salary record for an employee (fails if one already exists —
+        use update_salary_info for raises/changes)."""
+        payload = {
+            "employee_id": employee_id, "gross_salary": gross_salary,
+            "currency": currency, "effective_date": effective_date,
+            "pay_frequency": pay_frequency,
+        }
+        return self._request("POST", "/finance/salary", json=payload)
+
+    def update_salary_info(self, employee_id: str, **fields) -> Dict[str, Any]:
+        """Partial update, e.g. update_salary_info('E-2043', gross_salary=12500) for a raise."""
+        return self._request("PATCH", f"/finance/salary/{employee_id}", json=fields)
+
+    def list_payslips(self, employee_id: Optional[str] = None,
+                       period_year: Optional[int] = None,
+                       period_month: Optional[int] = None) -> List[Dict[str, Any]]:
+        """List payslips, optionally filtered by employee and/or period."""
+        params = {k: v for k, v in {
+            "employee_id": employee_id, "period_year": period_year,
+            "period_month": period_month,
+        }.items() if v is not None}
+        return self._request("GET", "/finance/payslips", params=params)
+
+    def get_payslip(self, payslip_ref: str) -> Dict[str, Any]:
+        """Fetch a single payslip by its reference, e.g. 'PS-2026-06-E2043'."""
+        return self._request("GET", f"/finance/payslips/{payslip_ref}")
+
+    def generate_payslip(self, employee_id: str, period_month: int, period_year: int,
+                          other_deductions: float = 0, other_deductions_note: Optional[str] = None,
+                          tax_deduction: Optional[float] = None) -> Dict[str, Any]:
+        """Generate a payslip for an employee/period from their current salary_info.
+        Fails (409) if a payslip already exists for that employee+period, or (400)
+        if the employee has no salary record yet."""
+        payload = {
+            "employee_id": employee_id, "period_month": period_month, "period_year": period_year,
+            "other_deductions": other_deductions, "other_deductions_note": other_deductions_note,
+            "tax_deduction": tax_deduction,
+        }
+        return self._request("POST", "/finance/payslips/generate", json=payload)

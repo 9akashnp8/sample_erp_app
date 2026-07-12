@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
-WORKDIR /app
 
-COPY ./certs/cpc-ca01.crt /usr/local/share/ca-certificates/
-RUN update-ca-certificates
+WORKDIR /app
 
 # Install dependencies first for better layer caching
 COPY requirements.txt .
