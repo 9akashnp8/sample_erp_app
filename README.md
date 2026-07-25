@@ -14,17 +14,21 @@ erp_app/
 │   ├── database.py            # sqlite3 connection helper
 │   ├── routers/
 │   │   ├── employees.py       # /employees endpoints
-│   │   └── finance.py         # /finance endpoints (bank accounts, salary, payslips)
+│   │   ├── finance.py         # /finance endpoints (bank accounts, salary, payslips)
+│   │   └── helpdesk.py        # /tickets endpoints + outbound webhook dispatch
 │   └── schemas/
 │       ├── employee.py        # Pydantic request/response models
-│       └── finance.py         # Pydantic request/response models
+│       ├── finance.py         # Pydantic request/response models
+│       └── helpdesk.py        # Pydantic request/response models
 ├── db/
 │   ├── schema_employees.sql   # employees table DDL
 │   ├── schema_finance.sql     # bank_accounts / salary_info / payslips DDL
+│   ├── schema_helpdesk.sql    # tickets table DDL
 │   └── erp.db                 # generated SQLite file (gitignore this)
 ├── scripts/
 │   ├── build_employees.py     # (re)creates + seeds the employees table
-│   └── build_finance.py       # (re)creates + seeds finance tables (run after build_employees.py)
+│   ├── build_finance.py       # (re)creates + seeds finance tables (run after build_employees.py)
+│   └── build_helpdesk.py      # (re)creates + seeds tickets (run after build_employees.py)
 ├── erp_client.py              # <-- agents import THIS, not the DB or routers
 ├── Dockerfile
 ├── docker-compose.yml
@@ -71,6 +75,7 @@ export ERP_BASE_URL=http://localhost:8000
 pip install -r requirements.txt
 python scripts/build_employees.py     # builds db/erp.db with 15 seed employees
 python scripts/build_finance.py       # seeds bank accounts, salary, payslips (run after the above)
+python scripts/build_helpdesk.py      # seeds tickets (run after the above)
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -141,6 +146,86 @@ Business rules enforced by the API (not just the seed data):
 - A payslip can't be generated twice for the same employee + period (409).
 - A payslip can't be generated for an employee with no salary record yet (400).
 
+## Helpdesk module
+
+`tickets`: `id, ticket_id (unique, server-generated e.g. TCK-000042), subject,
+description, requester_id (FK -> employees), assignee_id (FK -> employees,
+nullable), category, priority (Low/Medium/High/Urgent), status (Open/In
+Progress/Resolved/Closed), resolved_at, closed_at, created_at, updated_at`.
+
+There's no separate user/auth system in this app — employees *are* the
+users, so `requester_id`/`assignee_id` are just employee_ids, same as
+`manager_id` on the employee table.
+
+Unlike every other status-like field in this app (plain `str` with a
+comment), `status` and `priority` use Pydantic `Literal[...]` types. This is
+a deliberate, narrowly-scoped deviation: these values drive an outbound
+webhook to an external agent app (see below), so invalid values should 422
+at the API boundary instead of silently propagating downstream. `category`
+stays plain `str` (open-ended, like `department`). A ticket's initial
+`status` is never caller-suppliable — it's always created as `Open`
+server-side, so every real status transition goes through `PATCH` and is
+guaranteed to fire the `ticket.status_changed` webhook event.
+
+Seed data: 14 sample tickets across IT/Finance/Facilities/HR, spanning all
+four statuses and priorities, several left unassigned.
+
+| Method | Path                        | Purpose |
+|--------|-----------------------------|---------|
+| GET    | `/tickets`                  | List/search — filters: `status`, `priority`, `category`, `requester_id`, `assignee_id`, `q` (subject/description) |
+| GET    | `/tickets/{ticket_id}`      | Fetch one ticket |
+| POST   | `/tickets`                  | File a new ticket (always created as `status=Open`) |
+| PATCH  | `/tickets/{ticket_id}`      | Partial update — reassign, change priority/category, change status |
+| DELETE | `/tickets/{ticket_id}`      | Hard delete (test cleanup — prefer PATCH `status=Closed`) |
+
+Business rules enforced by the API:
+- Unknown `requester_id`/`assignee_id` → 404/400 as appropriate; `assignee_id`
+  can be `null` (unassigned).
+- `requester_id` is immutable after creation (not settable via PATCH).
+- Setting `status=Resolved` stamps `resolved_at`. Setting `status=Closed`
+  stamps `closed_at`, and backfills `resolved_at` too if the ticket skipped
+  straight from `Open`/`In Progress` to `Closed`.
+- Reopening a ticket (moving status away from `Resolved`/`Closed`) does
+  **not** clear `resolved_at`/`closed_at` — that history is preserved.
+
+### Webhook dispatch
+
+When `TICKET_WEBHOOK_URL` is set (env var), the API synchronously `POST`s a
+JSON event to it right after each successful ticket write — meant for a
+separate, external agentic app to react to ticket activity. If the env var
+is unset, dispatch is a no-op (default for local/Docker runs). This is a
+best-effort, fire-and-forget call (stdlib `urllib.request`, ~3s timeout,
+failures are logged and swallowed) — there's no retry queue or outbox, by
+design, to keep this sample app simple. `DELETE` never fires a webhook
+(it's test-cleanup only, not a real ticket lifecycle event).
+
+Events:
+- `ticket.created` — fired once on `POST /tickets`.
+- `ticket.status_changed` — fired on `PATCH` when `status` changes.
+- `ticket.assigned` — fired on `PATCH` when `assignee_id` changes (including
+  to/from `null` for assign/unassign).
+
+A single `PATCH` that changes both `status` and `assignee_id` fires two
+separate webhook calls.
+
+Payload shape:
+```json
+{
+  "event": "ticket.created | ticket.status_changed | ticket.assigned",
+  "timestamp": "2026-07-25 14:03:11",
+  "ticket": { "...full ticket object, same shape as GET /tickets/{id}..." },
+  "changes": { "status": {"old": "Open", "new": "In Progress"} }
+}
+```
+`changes` is present only for `ticket.status_changed` (key: `status`) and
+`ticket.assigned` (key: `assignee_id`); absent for `ticket.created`.
+
+Optional `TICKET_WEBHOOK_SECRET` env var, if set, is sent as an
+`X-Webhook-Secret` header — the receiving app should do a constant-time
+compare against its own copy of the secret. HMAC-signing the body would be
+the natural v2 hardening if this is ever exposed on a public endpoint, but
+is out of scope for this sample.
+
 ## Using it from agent code
 
 ```python
@@ -158,6 +243,12 @@ salary = erp.get_salary_info("E-2043")
 erp.update_salary_info("E-2043", gross_salary=13000)  # give a raise
 payslip = erp.generate_payslip("E-2043", period_month=7, period_year=2026)
 history = erp.list_payslips(employee_id="E-2043")
+
+ticket = erp.create_ticket("VPN drops constantly", "Disconnects every 20 min.",
+                            requester_id="E-1187", category="IT", priority="High")
+erp.assign_ticket(ticket["ticket_id"], assignee_id="E-4501")
+erp.resolve_ticket(ticket["ticket_id"])
+open_tickets = erp.list_tickets(status="Open", assignee_id="E-4501")
 ```
 
 To point at a different environment (real ERP, staging, etc.):
