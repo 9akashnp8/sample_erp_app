@@ -160,3 +160,60 @@ class ERPClient:
             "tax_deduction": tax_deduction,
         }
         return self._request("POST", "/finance/payslips/generate", json=payload)
+
+    # ---------- Helpdesk module ----------
+
+    def create_ticket(self, subject: str, description: str, requester_id: str,
+                       assignee_id: Optional[str] = None, category: str = "General",
+                       priority: str = "Medium") -> Dict[str, Any]:
+        """File a new ticket. Always created with status='Open'."""
+        payload = {
+            "subject": subject, "description": description, "requester_id": requester_id,
+            "assignee_id": assignee_id, "category": category, "priority": priority,
+        }
+        return self._request("POST", "/tickets", json=payload)
+
+    def get_ticket(self, ticket_id: str) -> Dict[str, Any]:
+        """Fetch a single ticket by its ticket_id, e.g. 'TCK-000042'."""
+        return self._request("GET", f"/tickets/{ticket_id}")
+
+    def list_tickets(
+        self,
+        status: Optional[str] = None,
+        priority: Optional[str] = None,
+        category: Optional[str] = None,
+        requester_id: Optional[str] = None,
+        assignee_id: Optional[str] = None,
+        q: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List/search tickets with optional filters."""
+        params = {k: v for k, v in {
+            "status": status, "priority": priority, "category": category,
+            "requester_id": requester_id, "assignee_id": assignee_id, "q": q,
+        }.items() if v is not None}
+        return self._request("GET", "/tickets", params=params)
+
+    def update_ticket(self, ticket_id: str, **fields) -> Dict[str, Any]:
+        """Partial update of any ticket field(s), e.g.
+        update_ticket('TCK-000042', priority='High')."""
+        return self._request("PATCH", f"/tickets/{ticket_id}", json=fields)
+
+    def assign_ticket(self, ticket_id: str, assignee_id: str) -> Dict[str, Any]:
+        """Convenience wrapper — assigns (or reassigns) a ticket to an employee."""
+        return self.update_ticket(ticket_id, assignee_id=assignee_id)
+
+    def resolve_ticket(self, ticket_id: str) -> Dict[str, Any]:
+        """Convenience wrapper — marks status='Resolved'."""
+        return self.update_ticket(ticket_id, status="Resolved")
+
+    def close_ticket(self, ticket_id: str) -> Dict[str, Any]:
+        """Convenience wrapper — marks status='Closed'."""
+        return self.update_ticket(ticket_id, status="Closed")
+
+    def reopen_ticket(self, ticket_id: str) -> Dict[str, Any]:
+        """Convenience wrapper — marks status='Open'."""
+        return self.update_ticket(ticket_id, status="Open")
+
+    def delete_ticket(self, ticket_id: str) -> None:
+        """Hard delete — mainly for test cleanup. Prefer close_ticket()."""
+        self._request("DELETE", f"/tickets/{ticket_id}")

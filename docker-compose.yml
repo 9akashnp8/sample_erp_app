@@ -8,6 +8,8 @@ services:
       - erp-db-data:/app/db
     environment:
       - RESET_DB=1   # set to 1 (or run `docker compose run -e RESET_DB=1 erp-api`) to reseed
+      # - TICKET_WEBHOOK_URL=https://your-agent-app.example/webhooks/tickets  # unset = webhook dispatch is a no-op
+      # - TICKET_WEBHOOK_SECRET=changeme   # sent as X-Webhook-Secret header when set
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
