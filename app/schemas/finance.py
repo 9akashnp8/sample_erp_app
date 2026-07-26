@@ -103,6 +103,8 @@ class Payslip(BaseModel):
     tax_deduction: float
     other_deductions: float
     other_deductions_note: Optional[str] = None
+    unpaid_leave_days: int
+    leave_deduction: float
     net_pay: float
     currency: str
     status: str

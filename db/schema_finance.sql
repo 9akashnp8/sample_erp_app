@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS payslips (
     tax_deduction       REAL    NOT NULL DEFAULT 0,
     other_deductions    REAL    NOT NULL DEFAULT 0,
     other_deductions_note TEXT,
-    net_pay             REAL    NOT NULL,                 -- gross - tax - other
+    unpaid_leave_days   INTEGER NOT NULL DEFAULT 0,        -- Unpaid+Approved leave_requests days attributed to this period
+    leave_deduction     REAL    NOT NULL DEFAULT 0,        -- (gross_salary / WORKING_DAYS_PER_MONTH) * unpaid_leave_days
+    net_pay             REAL    NOT NULL,                 -- gross - tax - other - leave_deduction
     currency            TEXT    NOT NULL DEFAULT 'USD',
     status              TEXT    NOT NULL DEFAULT 'Generated', -- Generated, Sent
     generated_at        TEXT    NOT NULL DEFAULT (datetime('now')),

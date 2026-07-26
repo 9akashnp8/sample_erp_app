@@ -14,6 +14,7 @@ from app.schemas.finance import (
 router = APIRouter(prefix="/finance", tags=["Finance"])
 
 TAX_RATE = 0.18  # flat sample rate used when tax_deduction isn't explicitly supplied
+WORKING_DAYS_PER_MONTH = 22  # flat sample assumption, same style as TAX_RATE
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
@@ -33,6 +34,27 @@ def _require_employee(conn: sqlite3.Connection, employee_id: str) -> sqlite3.Row
     if not emp:
         raise HTTPException(status_code=404, detail=f"Employee '{employee_id}' not found")
     return emp
+
+
+def _unpaid_leave_days(conn: sqlite3.Connection, employee_id: str, period_month: int, period_year: int) -> int:
+    """Calendar days from Unpaid+Approved leave_requests whose start_date falls
+    in this period. Attribution is by start_date only — a request whose
+    end_date crosses into the next month is NOT split/prorated across two
+    payslips (documented simplification, matches this app's flat-assumption
+    style, e.g. TAX_RATE). No try/except here for a missing leave_requests
+    table — finance has a real, intentional dependency on the leave module
+    now, and this app's convention (see build_finance.py/build_helpdesk.py)
+    is to fail loudly on a missing dependency, not silently degrade."""
+    start = f"{period_year:04d}-{period_month:02d}-01"
+    nxt = (f"{period_year + 1:04d}-01-01" if period_month == 12
+           else f"{period_year:04d}-{period_month + 1:02d}-01")
+    row = conn.execute(
+        """SELECT COALESCE(SUM(days), 0) FROM leave_requests
+           WHERE employee_id = ? AND leave_type = 'Unpaid' AND status = 'Approved'
+             AND start_date >= ? AND start_date < ?""",
+        (employee_id, start, nxt),
+    ).fetchone()
+    return row[0]
 
 
 # ============================================================
@@ -361,7 +383,9 @@ def generate_payslip(payload: PayslipGenerateRequest):
         currency = salary["currency"]
         tax = payload.tax_deduction if payload.tax_deduction is not None else round(gross * TAX_RATE, 2)
         other = payload.other_deductions
-        net = round(gross - tax - other, 2)
+        unpaid_days = _unpaid_leave_days(conn, payload.employee_id, payload.period_month, payload.period_year)
+        leave_deduction = round((gross / WORKING_DAYS_PER_MONTH) * unpaid_days, 2) if unpaid_days else 0.0
+        net = round(gross - tax - other - leave_deduction, 2)
 
         ref = f"PS-{payload.period_year}-{payload.period_month:02d}-{payload.employee_id.replace('E-', 'E')}"
 
@@ -369,12 +393,13 @@ def generate_payslip(payload: PayslipGenerateRequest):
             """
             INSERT INTO payslips
             (payslip_ref, employee_id, period_month, period_year, gross_salary,
-             tax_deduction, other_deductions, other_deductions_note, net_pay,
+             tax_deduction, other_deductions, other_deductions_note,
+             unpaid_leave_days, leave_deduction, net_pay,
              currency, status, generated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?, 'Generated', datetime('now'))
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'Generated', datetime('now'))
             """,
             (ref, payload.employee_id, payload.period_month, payload.period_year, gross,
-             tax, other, payload.other_deductions_note, net, currency),
+             tax, other, payload.other_deductions_note, unpaid_days, leave_deduction, net, currency),
         )
         conn.commit()
 

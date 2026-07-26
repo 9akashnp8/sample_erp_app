@@ -7,7 +7,11 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "db", "erp.db")
-SCHEMA_PATH = os.path.join(BASE_DIR, "db", "schema_employees.sql")
+# SCHEMA_DIR defaults to db/ for local runs; the Docker image sets it to a
+# path baked into the image (not the persisted-data volume) so schema files
+# are never shadowed by a stale volume — see Dockerfile.
+SCHEMA_DIR = os.environ.get("SCHEMA_DIR", os.path.join(BASE_DIR, "db"))
+SCHEMA_PATH = os.path.join(SCHEMA_DIR, "schema_employees.sql")
 
 
 def build():
