@@ -8,7 +8,8 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "db", "erp.db")
-SCHEMA_PATH = os.path.join(BASE_DIR, "db", "schema_helpdesk.sql")
+SCHEMA_DIR = os.environ.get("SCHEMA_DIR", os.path.join(BASE_DIR, "db"))
+SCHEMA_PATH = os.path.join(SCHEMA_DIR, "schema_helpdesk.sql")
 
 
 def build():

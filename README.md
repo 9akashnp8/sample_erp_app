@@ -15,20 +15,24 @@ erp_app/
 │   ├── routers/
 │   │   ├── employees.py       # /employees endpoints
 │   │   ├── finance.py         # /finance endpoints (bank accounts, salary, payslips)
-│   │   └── helpdesk.py        # /tickets endpoints + outbound webhook dispatch
+│   │   ├── helpdesk.py        # /tickets endpoints + outbound webhook dispatch
+│   │   └── leave.py           # /leave-requests endpoints
 │   └── schemas/
 │       ├── employee.py        # Pydantic request/response models
 │       ├── finance.py         # Pydantic request/response models
-│       └── helpdesk.py        # Pydantic request/response models
+│       ├── helpdesk.py        # Pydantic request/response models
+│       └── leave.py           # Pydantic request/response models
 ├── db/
 │   ├── schema_employees.sql   # employees table DDL
 │   ├── schema_finance.sql     # bank_accounts / salary_info / payslips DDL
 │   ├── schema_helpdesk.sql    # tickets table DDL
+│   ├── schema_leave.sql       # leave_requests table DDL
 │   └── erp.db                 # generated SQLite file (gitignore this)
 ├── scripts/
 │   ├── build_employees.py     # (re)creates + seeds the employees table
 │   ├── build_finance.py       # (re)creates + seeds finance tables (run after build_employees.py)
-│   └── build_helpdesk.py      # (re)creates + seeds tickets (run after build_employees.py)
+│   ├── build_helpdesk.py      # (re)creates + seeds tickets (run after build_employees.py)
+│   └── build_leave.py         # (re)creates + seeds leave requests (run after build_employees.py)
 ├── erp_client.py              # <-- agents import THIS, not the DB or routers
 ├── Dockerfile
 ├── docker-compose.yml
@@ -46,13 +50,31 @@ That's it. The container seeds `db/erp.db` on first boot (persisted in a
 named volume, so restarts keep your data), then starts the API on
 `http://localhost:8000`. Interactive docs: `http://localhost:8000/docs`.
 
-To force a full reseed back to the 15 sample employees (wipes any changes
-made through the API):
+Only `erp.db` itself lives in that named volume — the `db/schema_*.sql`
+files are copied into the image at `/app/schema` (`SCHEMA_DIR` env var, set
+in the Dockerfile) rather than into the volume-mounted `/app/db`. This
+matters because a named volume is only auto-populated from the image on its
+*first* creation; if schema files lived inside it, adding a new module's
+schema file to a later image would get permanently shadowed by an
+already-existing volume from an older build, and even `RESET_DB=1` wouldn't
+surface it (it reseeds from whatever's in `/app/db`, which the volume has
+frozen). Keeping schema files outside the volume means a plain rebuild +
+reseed is always enough — you should only need to drop the volume to wipe
+actual data, not to pick up schema changes.
+
+To force a full reseed back to the sample data (wipes any changes made
+through the API):
+
+```bash
+docker compose run -e RESET_DB=1 erp-api
+```
+
+Or, to also wipe the volume entirely (e.g. after changing `docker-compose.yml`'s
+`environment:` block, or if you suspect the volume predates this schema/data
+separation):
 
 ```bash
 docker compose down -v && docker compose up --build     # -v drops the volume
-# or, without dropping the volume:
-docker compose run -e RESET_DB=1 erp-api
 ```
 
 Without Compose, plain Docker works too:
@@ -76,6 +98,7 @@ pip install -r requirements.txt
 python scripts/build_employees.py     # builds db/erp.db with 15 seed employees
 python scripts/build_finance.py       # seeds bank accounts, salary, payslips (run after the above)
 python scripts/build_helpdesk.py      # seeds tickets (run after the above)
+python scripts/build_leave.py         # seeds leave requests (run after the above; finance depends on this for payslip generation)
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -124,6 +147,8 @@ the 13 `Active` employees (payslips — 3 months of history each, Apr–Jun 2026
 - **`payslips`** — one per employee per period (`period_month`/`period_year`),
   generated from `salary_info` at creation time. `gross_salary` is snapshotted
   onto the payslip so later raises don't retroactively change historical payslips.
+  Also carries `unpaid_leave_days` and `leave_deduction` — see "Leave module"
+  below for how these are computed. `net_pay = gross - tax - other - leave_deduction`.
 
 | Method | Path                                  | Purpose |
 |--------|----------------------------------------|---------|
@@ -145,6 +170,18 @@ Business rules enforced by the API (not just the seed data):
   un-sets any other primary account for that employee.
 - A payslip can't be generated twice for the same employee + period (409).
 - A payslip can't be generated for an employee with no salary record yet (400).
+- Generating a payslip looks up `Unpaid` + `Approved` leave requests (see the
+  Leave module below) for that employee whose `start_date` falls in the
+  requested period, and deducts `(gross_salary / WORKING_DAYS_PER_MONTH) *
+  unpaid_days` from `net_pay`. `WORKING_DAYS_PER_MONTH = 22` is a flat sample
+  assumption (same style as the flat 18% `TAX_RATE`) — no real working-day
+  calendar is modeled. A leave request is attributed entirely to the month
+  its `start_date` falls in; a request whose `end_date` crosses into the next
+  month is **not** split/prorated across two payslips. This is now a hard
+  dependency — `finance` requires the `leave_requests` table to exist (i.e.
+  `build_leave.py` must have run), and will error rather than silently
+  degrade if it hasn't, consistent with how every other module here fails
+  loudly on a missing dependency rather than gracefully falling back.
 
 ## Helpdesk module
 
@@ -226,6 +263,55 @@ compare against its own copy of the secret. HMAC-signing the body would be
 the natural v2 hardening if this is ever exposed on a public endpoint, but
 is out of scope for this sample.
 
+## Leave module
+
+`leave_requests`: `id, leave_id (unique, server-generated e.g. LV-000012),
+employee_id (FK -> employees), leave_type (Annual/Sick/Unpaid/Other), status
+(Approved/Rejected/Cancelled), start_date, end_date, days (server-computed,
+calendar days inclusive of both endpoints), reason, created_at, updated_at`.
+
+Two things about this module deliberately differ from Helpdesk's ticket
+workflow:
+- **No approval workflow.** There's no separate approver role modeled in
+  this app, so a leave request is created already in its final state —
+  `status` is *required* on create (unlike a ticket's status, which is
+  always server-forced to `Open`). The caller states the real-world outcome
+  directly.
+- **`leave_type`/`status` use `Literal[...]`**, like tickets — but for a
+  different reason. There's no webhook here; instead, `finance.py`'s payslip
+  generation does an exact string match on `leave_type == "Unpaid"` and
+  `status == "Approved"` to compute a salary deduction (see Finance module
+  above), so a typo'd value needs to 422 at the API boundary rather than
+  silently break that match.
+
+No overlap validation: two `Approved`+`Unpaid` requests for the same
+employee covering the same dates will double-count in the payslip deduction
+(`SUM(days)`) — not enforced at the DB/API level, same minimalism as
+`bank_accounts` allowing multiple accounts per employee with no overlap
+concept. Also **not** wired up: `leave_requests.status` has no automation
+with the existing `employees.status = 'On Leave'` value — they're
+independent.
+
+Seed data: 14 sample leave requests across all employees/types/statuses,
+including several `Unpaid`+`Approved` requests dated in July 2026 (for
+`E-2043` among others) so generating a July payslip demonstrates the
+deduction — see "Using it from agent code" below.
+
+| Method | Path                              | Purpose |
+|--------|-----------------------------------|---------|
+| GET    | `/leave-requests`                 | List/search — filters: `employee_id`, `leave_type`, `status`, `period_year`+`period_month` (matches `start_date`) |
+| GET    | `/leave-requests/{leave_id}`      | Fetch one leave request |
+| POST   | `/leave-requests`                 | Create a leave request (status required — no workflow) |
+| PATCH  | `/leave-requests/{leave_id}`      | Partial update — status, dates, type, reason |
+| DELETE | `/leave-requests/{leave_id}`      | Hard delete (test cleanup) |
+
+Business rules enforced by the API:
+- Unknown `employee_id` → 404. `employee_id` is immutable after creation.
+- `end_date` must be on or after `start_date` (400 otherwise), on both
+  create and update.
+- `days` is never caller-supplied — always computed server-side from
+  `start_date`/`end_date`, and recomputed on any `PATCH` that changes either.
+
 ## Using it from agent code
 
 ```python
@@ -249,6 +335,15 @@ ticket = erp.create_ticket("VPN drops constantly", "Disconnects every 20 min.",
 erp.assign_ticket(ticket["ticket_id"], assignee_id="E-4501")
 erp.resolve_ticket(ticket["ticket_id"])
 open_tickets = erp.list_tickets(status="Open", assignee_id="E-4501")
+
+# Cross-domain example: explain a salary difference using leave data
+erp.create_leave_request("E-2043", leave_type="Unpaid", status="Approved",
+                          start_date="2026-07-06", end_date="2026-07-06",
+                          reason="Personal matter")
+payslip = erp.generate_payslip("E-2043", period_month=7, period_year=2026)
+# payslip["unpaid_leave_days"] and payslip["leave_deduction"] explain why
+# payslip["net_pay"] is lower than a period with no unpaid leave.
+leave_history = erp.list_leave_requests(employee_id="E-2043", period_year=2026, period_month=7)
 ```
 
 To point at a different environment (real ERP, staging, etc.):
@@ -259,13 +354,13 @@ export ERP_BASE_URL=https://real-erp.company.com/api
 
 or `ERPClient(base_url="https://real-erp.company.com/api")` explicitly.
 
-## Adding the next module (e.g. leave requests)
+## Adding the next module (e.g. expense reports)
 
-1. Add `db/schema_leave.sql` + a `scripts/build_leave.py` seeder (call it after `build_employees.py`, same pattern as `build_finance.py`).
-2. Add `app/schemas/leave.py` (Pydantic models).
-3. Add `app/routers/leave.py` (endpoints), same CRUD pattern as `employees.py`/`finance.py`.
-4. Register it in `app/main.py`: `app.include_router(leave.router)`.
-5. Add corresponding methods to `erp_client.py` under a `# ---- Leave module ----` section.
+1. Add `db/schema_expenses.sql` + a `scripts/build_expenses.py` seeder (call it after `build_employees.py`, same pattern as `build_finance.py`).
+2. Add `app/schemas/expenses.py` (Pydantic models).
+3. Add `app/routers/expenses.py` (endpoints), same CRUD pattern as `employees.py`/`finance.py`.
+4. Register it in `app/main.py`: `app.include_router(expenses.router)`.
+5. Add corresponding methods to `erp_client.py` under a `# ---- Expenses module ----` section.
 6. Add the new seed script to `entrypoint.sh`'s seeding block.
 
 Keeping every module's router + schema + client methods this consistent is

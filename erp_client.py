@@ -217,3 +217,48 @@ class ERPClient:
     def delete_ticket(self, ticket_id: str) -> None:
         """Hard delete — mainly for test cleanup. Prefer close_ticket()."""
         self._request("DELETE", f"/tickets/{ticket_id}")
+
+    # ---------- Leave module ----------
+
+    def create_leave_request(self, employee_id: str, leave_type: str, status: str,
+                              start_date: str, end_date: str,
+                              reason: Optional[str] = None) -> Dict[str, Any]:
+        """Create a leave request already in its final state (Approved/Rejected/
+        Cancelled) — there is no approval workflow, so status is required."""
+        payload = {
+            "employee_id": employee_id, "leave_type": leave_type, "status": status,
+            "start_date": start_date, "end_date": end_date, "reason": reason,
+        }
+        return self._request("POST", "/leave-requests", json=payload)
+
+    def get_leave_request(self, leave_id: str) -> Dict[str, Any]:
+        """Fetch a single leave request by its leave_id, e.g. 'LV-000012'."""
+        return self._request("GET", f"/leave-requests/{leave_id}")
+
+    def list_leave_requests(
+        self,
+        employee_id: Optional[str] = None,
+        leave_type: Optional[str] = None,
+        status: Optional[str] = None,
+        period_year: Optional[int] = None,
+        period_month: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """List/search leave requests with optional filters."""
+        params = {k: v for k, v in {
+            "employee_id": employee_id, "leave_type": leave_type, "status": status,
+            "period_year": period_year, "period_month": period_month,
+        }.items() if v is not None}
+        return self._request("GET", "/leave-requests", params=params)
+
+    def update_leave_request(self, leave_id: str, **fields) -> Dict[str, Any]:
+        """Partial update of any leave request field(s), e.g.
+        update_leave_request('LV-000012', status='Rejected')."""
+        return self._request("PATCH", f"/leave-requests/{leave_id}", json=fields)
+
+    def cancel_leave_request(self, leave_id: str) -> Dict[str, Any]:
+        """Convenience wrapper — marks status='Cancelled'."""
+        return self.update_leave_request(leave_id, status="Cancelled")
+
+    def delete_leave_request(self, leave_id: str) -> None:
+        """Hard delete — mainly for test cleanup."""
+        self._request("DELETE", f"/leave-requests/{leave_id}")
