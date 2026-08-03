@@ -262,3 +262,110 @@ class ERPClient:
     def delete_leave_request(self, leave_id: str) -> None:
         """Hard delete — mainly for test cleanup."""
         self._request("DELETE", f"/leave-requests/{leave_id}")
+
+    # ---------- Performance management module ----------
+
+    def list_competencies(self, active: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """The pre-defined company core competencies every appraisal is rated
+        against. Read-only — competencies are seed/reference data."""
+        params = {} if active is None else {"active": active}
+        return self._request("GET", "/performance/competencies", params=params)
+
+    def create_performance_review(self, employee_id: str, cycle_year: int) -> Dict[str, Any]:
+        """Open a review cycle. Starts at status='Draft'; the reviewing manager
+        is snapshotted from the employee's current manager_id."""
+        payload = {"employee_id": employee_id, "cycle_year": cycle_year}
+        return self._request("POST", "/performance/reviews", json=payload)
+
+    def get_performance_review(self, review_ref: str) -> Dict[str, Any]:
+        """Fetch one review with its objectives and competency ratings —
+        e.g. 'PR-2026-E2043'. Both sides' ratings come back on the same rows."""
+        return self._request("GET", f"/performance/reviews/{review_ref}")
+
+    def list_performance_reviews(
+        self,
+        employee_id: Optional[str] = None,
+        manager_id: Optional[str] = None,
+        cycle_year: Optional[int] = None,
+        status: Optional[str] = None,
+        stage: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List/search reviews. Pass manager_id (+ status) for a manager's
+        action queue, employee_id for one person's review history."""
+        params = {k: v for k, v in {
+            "employee_id": employee_id, "manager_id": manager_id,
+            "cycle_year": cycle_year, "status": status, "stage": stage,
+        }.items() if v is not None}
+        return self._request("GET", "/performance/reviews", params=params)
+
+    def delete_performance_review(self, review_ref: str) -> None:
+        """Hard delete — mainly for test cleanup. Objectives and competency
+        ratings cascade with it."""
+        self._request("DELETE", f"/performance/reviews/{review_ref}")
+
+    # -- Objective setting phase --
+
+    def list_objectives(self, review_ref: str) -> List[Dict[str, Any]]:
+        """List the objectives set (or being set) for a review."""
+        return self._request("GET", f"/performance/reviews/{review_ref}/objectives")
+
+    def add_objective(self, review_ref: str, description: str, weightage: int) -> Dict[str, Any]:
+        """Add an objective. Only allowed while the review is with the employee
+        (status Draft or Objectives Sent Back)."""
+        payload = {"description": description, "weightage": weightage}
+        return self._request("POST", f"/performance/reviews/{review_ref}/objectives", json=payload)
+
+    def update_objective(self, objective_id: int, **fields) -> Dict[str, Any]:
+        """Partial update of an objective's description/weightage, e.g.
+        update_objective(7, weightage=30). Ratings go through the assessment calls."""
+        return self._request("PATCH", f"/performance/objectives/{objective_id}", json=fields)
+
+    def delete_objective(self, objective_id: int) -> None:
+        """Remove an objective (same status guard as editing one)."""
+        self._request("DELETE", f"/performance/objectives/{objective_id}")
+
+    def submit_objectives(self, review_ref: str) -> Dict[str, Any]:
+        """Employee action — send objectives to the manager for approval.
+        Fails (400) unless weightages total exactly 100."""
+        return self._request("POST", f"/performance/reviews/{review_ref}/submit-objectives")
+
+    def approve_objectives(self, review_ref: str, notes: Optional[str] = None) -> Dict[str, Any]:
+        """Manager action — approve the submitted objectives, ending the
+        objective setting phase and opening the appraisal phase."""
+        return self._request(
+            "POST", f"/performance/reviews/{review_ref}/review-objectives",
+            json={"decision": "Approve", "notes": notes},
+        )
+
+    def send_back_objectives(self, review_ref: str, notes: str) -> Dict[str, Any]:
+        """Manager action — return the objectives for revision. `notes` is
+        required: the employee needs to know what to change."""
+        return self._request(
+            "POST", f"/performance/reviews/{review_ref}/review-objectives",
+            json={"decision": "Send Back", "notes": notes},
+        )
+
+    # -- Appraisal phase --
+
+    def submit_self_assessment(self, review_ref: str,
+                                objectives: List[Dict[str, Any]],
+                                competencies: List[Dict[str, Any]],
+                                submit: bool = True) -> Dict[str, Any]:
+        """Employee action — rate each objective and core competency 1-5.
+
+        objectives:   [{"objective_id": 12, "rating": 4, "notes": "..."}, ...]
+        competencies: [{"competency_code": "COLLAB", "rating": 5, "notes": "..."}, ...]
+
+        submit=False saves a partial draft; submit=True requires everything to
+        be rated and sends it to the manager."""
+        payload = {"objectives": objectives, "competencies": competencies, "submit": submit}
+        return self._request("POST", f"/performance/reviews/{review_ref}/self-assessment", json=payload)
+
+    def submit_manager_assessment(self, review_ref: str,
+                                   objectives: List[Dict[str, Any]],
+                                   competencies: List[Dict[str, Any]],
+                                   submit: bool = True) -> Dict[str, Any]:
+        """Manager action — same payload shape as the self assessment, written
+        to the manager_* columns. Submitting completes the review."""
+        payload = {"objectives": objectives, "competencies": competencies, "submit": submit}
+        return self._request("POST", f"/performance/reviews/{review_ref}/manager-assessment", json=payload)

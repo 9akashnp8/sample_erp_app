@@ -16,23 +16,27 @@ erp_app/
 │   │   ├── employees.py       # /employees endpoints
 │   │   ├── finance.py         # /finance endpoints (bank accounts, salary, payslips)
 │   │   ├── helpdesk.py        # /tickets endpoints + outbound webhook dispatch
-│   │   └── leave.py           # /leave-requests endpoints
+│   │   ├── leave.py           # /leave-requests endpoints
+│   │   └── performance.py     # /performance endpoints (review workflow, objectives, appraisals)
 │   └── schemas/
 │       ├── employee.py        # Pydantic request/response models
 │       ├── finance.py         # Pydantic request/response models
 │       ├── helpdesk.py        # Pydantic request/response models
-│       └── leave.py           # Pydantic request/response models
+│       ├── leave.py           # Pydantic request/response models
+│       └── performance.py     # Pydantic request/response models
 ├── db/
 │   ├── schema_employees.sql   # employees table DDL
 │   ├── schema_finance.sql     # bank_accounts / salary_info / payslips DDL
 │   ├── schema_helpdesk.sql    # tickets table DDL
 │   ├── schema_leave.sql       # leave_requests table DDL
+│   ├── schema_performance.sql # competencies / performance_reviews / objectives / competency ratings DDL
 │   └── erp.db                 # generated SQLite file (gitignore this)
 ├── scripts/
 │   ├── build_employees.py     # (re)creates + seeds the employees table
 │   ├── build_finance.py       # (re)creates + seeds finance tables (run after build_employees.py)
 │   ├── build_helpdesk.py      # (re)creates + seeds tickets (run after build_employees.py)
-│   └── build_leave.py         # (re)creates + seeds leave requests (run after build_employees.py)
+│   ├── build_leave.py         # (re)creates + seeds leave requests (run after build_employees.py)
+│   └── build_performance.py   # (re)creates + seeds performance reviews (run after build_employees.py)
 ├── erp_client.py              # <-- agents import THIS, not the DB or routers
 ├── Dockerfile
 ├── docker-compose.yml
@@ -99,6 +103,7 @@ python scripts/build_employees.py     # builds db/erp.db with 15 seed employees
 python scripts/build_finance.py       # seeds bank accounts, salary, payslips (run after the above)
 python scripts/build_helpdesk.py      # seeds tickets (run after the above)
 python scripts/build_leave.py         # seeds leave requests (run after the above; finance depends on this for payslip generation)
+python scripts/build_performance.py   # seeds competencies + performance reviews (run after the above)
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -312,6 +317,140 @@ Business rules enforced by the API:
 - `days` is never caller-supplied — always computed server-side from
   `start_date`/`end_date`, and recomputed on any `PATCH` that changes either.
 
+## Performance management module
+
+Four tables: `competencies` (pre-defined company core competencies — read-only
+reference data), `performance_reviews` (one per employee per cycle year),
+`performance_objectives` and `performance_competency_ratings` (both children of
+a review, cascade-deleted with it).
+
+This is the first module here with a **real approval workflow** — the opposite
+choice from Leave, where a request is created already in its final state. A
+review's `status` is never caller-suppliable: it starts at `Draft` and only
+moves via the workflow endpoints, each of which refuses to run from the wrong
+state (`409`). That state machine *is* the module.
+
+```
+Objective Setting stage                         Appraisal stage              Done
+────────────────────────────────                ─────────────────────────    ─────────
+Draft ──submit-objectives──► Objectives Submitted
+                                   │
+        ┌──────────────────────────┴──────────────────────────┐
+   review-objectives                                   review-objectives
+   decision="Send Back"                                decision="Approve"
+        │                                                     │
+        ▼                                                     ▼
+Objectives Sent Back ──submit-objectives──► (back to Submitted)
+                                                       Objectives Approved
+                                                              │  self-assessment
+                                                              ▼
+                                                  Self Assessment Submitted
+                                                              │  manager-assessment
+                                                              ▼
+                                                          Completed
+```
+
+`stage` (`Objective Setting` / `Appraisal` / `Completed`) is returned on every
+review but is **not stored** — it's derived from `status` in the router, so the
+two can't drift. You can filter by either (`?stage=Appraisal` expands back into
+the statuses it covers).
+
+### Objective setting phase
+
+1. The employee adds objectives — a description plus a `weightage` — one at a
+   time via `POST /performance/reviews/{ref}/objectives`. The running total is
+   deliberately *not* validated here; objectives are added incrementally.
+2. `POST .../submit-objectives` sends them to the manager. **This** is where the
+   weightages must total exactly `100` (`400` otherwise, with the actual total in
+   the message) and at least one objective must exist. Enforcing it here is what
+   lets the appraisal-phase weighted score come out on a plain 1–5 scale.
+3. The manager calls `POST .../review-objectives` with `decision: "Approve"` or
+   `decision: "Send Back"`. `notes` is **required** on a send-back and optional
+   on approve; either way it overwrites `objectives_manager_notes` (approving
+   with no notes deliberately clears a stale send-back reason). A sent-back
+   review goes back to being editable and can be re-submitted.
+4. Once approved, the objective set is frozen — `POST`/`PATCH`/`DELETE` on
+   objectives all `409` from `Objectives Approved` onward. That's what makes the
+   frozen scores below meaningful.
+
+### Appraisal phase
+
+Both sides rate the same two things — every objective and every **active**
+competency — on a 1–5 scale with optional notes, through two endpoints that take
+an identical payload and differ only in which columns they write:
+
+- `POST /performance/reviews/{ref}/self-assessment` → writes `self_rating` /
+  `self_notes`, requires status `Objectives Approved`, moves to
+  `Self Assessment Submitted`.
+- `POST /performance/reviews/{ref}/manager-assessment` → writes `manager_rating` /
+  `manager_notes`, requires status `Self Assessment Submitted`, moves to
+  `Completed`.
+
+Both accept `submit: false` to save a partial draft without advancing the
+workflow; `submit: true` (the default) requires **everything** rated and is
+rejected with a `400` listing exactly what's missing. A rejected submit rolls
+back — a half-applied assessment would be worse than none. Completeness is
+checked against what's stored, so drafts saved earlier count.
+
+The manager sees the employee's ratings simply by reading the review: both sides
+live on the same rows, and `GET /performance/reviews/{ref}` returns objectives
+and competency ratings with `self_*` and `manager_*` side by side. The manager
+assessment never modifies the employee's columns.
+
+On each submit, three scores are computed once and **frozen** onto the review
+(same reasoning as payslips snapshotting `gross_salary` — a later change can't
+retroactively rewrite a submitted assessment):
+
+- `*_objective_score` = `SUM(rating × weightage) / 100` — a weighted mean, back
+  on the 1–5 scale because the weightages are guaranteed to total 100.
+- `*_competency_score` = plain mean of the competency ratings (core competencies
+  all count equally — there's no weighting concept there).
+- `*_overall_rating` = `0.7 × objective + 0.3 × competency`. Those two weights
+  are flat sample assumptions, same style as finance's `TAX_RATE` and
+  `WORKING_DAYS_PER_MONTH`.
+
+| Method | Path                                              | Purpose |
+|--------|---------------------------------------------------|---------|
+| GET    | `/performance/competencies`                       | The pre-defined core competencies — filter `active` |
+| GET    | `/performance/reviews`                            | List/search — filters: `employee_id`, `manager_id`, `cycle_year`, `status`, `stage` |
+| GET    | `/performance/reviews/{review_ref}`               | One review with its objectives + competency ratings (both sides) |
+| POST   | `/performance/reviews`                            | Open a cycle for an employee/year (always starts `Draft`) |
+| DELETE | `/performance/reviews/{review_ref}`               | Hard delete (test cleanup — cascades to objectives/ratings) |
+| GET    | `/performance/reviews/{review_ref}/objectives`    | List a review's objectives |
+| POST   | `/performance/reviews/{review_ref}/objectives`    | Add an objective (employee-editable statuses only) |
+| PATCH  | `/performance/objectives/{objective_id}`          | Edit description/weightage (not ratings) |
+| DELETE | `/performance/objectives/{objective_id}`          | Remove an objective |
+| POST   | `/performance/reviews/{review_ref}/submit-objectives` | Employee: send objectives for approval (weightages must total 100) |
+| POST   | `/performance/reviews/{review_ref}/review-objectives` | Manager: `Approve`, or `Send Back` with notes |
+| POST   | `/performance/reviews/{review_ref}/self-assessment`   | Employee: rate objectives + competencies |
+| POST   | `/performance/reviews/{review_ref}/manager-assessment`| Manager: rate the same, completing the review |
+
+Other business rules enforced by the API:
+- The reviewing `manager_id` is **snapshotted** from the employee's current
+  manager when the cycle opens. A reorg mid-cycle does not move an in-flight
+  review to the new manager.
+- An employee with no manager (top of the org — `E-1000`/`E-1001`/`E-1002`)
+  can't have a review: there'd be nobody to approve objectives (`400`).
+  Terminated employees are rejected too (`400`); `On Leave` ones are fine.
+- One review per employee per `cycle_year` (`409` on a duplicate).
+- Ratings outside 1–5 → `422`; weightage outside 1–100 → `422`.
+- Rating an objective that belongs to a different review, an unknown/retired
+  competency, or the same thing twice in one payload → `400`.
+
+Competencies are **read-only over the API** (`GET` only, no `POST`/`PATCH`/
+`DELETE`) — a company-wide core competency list isn't something an employee or
+manager edits per review. Change them in `scripts/build_performance.py`. The
+`active` flag exists so one can be retired without breaking historical reviews
+that already rated it: only active competencies are required on submit.
+
+Seed data: 5 core competencies (`COLLAB`, `OWN`, `COMM`, `CUST`, `INNOV`) and 12
+reviews covering **every** status in the workflow, so an agent can be pointed at
+a review in any stage without having to drive one there first. `E-2043` has two
+completed cycles (2025 and 2026) for year-on-year comparison; `PR-2026-E1902` is
+sitting in `Objectives Sent Back` with the manager's notes; `PR-2026-E4890` is a
+`Draft` whose weightages total 70 and `PR-2026-E2210` a `Draft` with no
+objectives at all — the two cases `submit-objectives` rejects.
+
 ## Using it from agent code
 
 ```python
@@ -344,6 +483,43 @@ payslip = erp.generate_payslip("E-2043", period_month=7, period_year=2026)
 # payslip["unpaid_leave_days"] and payslip["leave_deduction"] explain why
 # payslip["net_pay"] is lower than a period with no unpaid leave.
 leave_history = erp.list_leave_requests(employee_id="E-2043", period_year=2026, period_month=7)
+
+# Performance management — a full cycle, both phases
+review = erp.create_performance_review("E-2043", cycle_year=2027)
+ref = review["review_ref"]                                     # "PR-2027-E2043"
+
+# Objective setting: employee adds objectives, manager approves them
+o1 = erp.add_objective(ref, "Ship v2 of the ingest pipeline", weightage=50)
+o2 = erp.add_objective(ref, "Cut on-call pages from 40/mo to 20/mo", weightage=30)
+o3 = erp.add_objective(ref, "Mentor one junior engineer", weightage=20)
+erp.submit_objectives(ref)                                     # 400 unless they total 100
+erp.send_back_objectives(ref, "Objective 2 needs a measurable target.")
+erp.update_objective(o2["id"], description="Cut on-call pages from 40/mo to 20/mo")
+erp.submit_objectives(ref)
+erp.approve_objectives(ref, notes="Approved.")                 # -> stage "Appraisal"
+
+# Appraisal: employee self-assesses, then the manager assesses the same items
+competencies = erp.list_competencies(active=True)
+erp.submit_self_assessment(
+    ref,
+    objectives=[{"objective_id": o1["id"], "rating": 5, "notes": "Shipped in March."},
+                {"objective_id": o2["id"], "rating": 4, "notes": "Down to 22/mo."},
+                {"objective_id": o3["id"], "rating": 3}],
+    competencies=[{"competency_code": c["code"], "rating": 4} for c in competencies],
+)
+done = erp.submit_manager_assessment(
+    ref,
+    objectives=[{"objective_id": o1["id"], "rating": 4, "notes": "Shipped, scope trimmed."},
+                {"objective_id": o2["id"], "rating": 5},
+                {"objective_id": o3["id"], "rating": 3}],
+    competencies=[{"competency_code": c["code"], "rating": 4} for c in competencies],
+)
+# done["status"] == "Completed"; self_overall_rating vs manager_overall_rating
+# quantify the gap, and done["objectives"] carries both sides' ratings + notes.
+
+# A manager's action queue, and one employee's history across cycles
+queue = erp.list_performance_reviews(manager_id="E-3320", status="Objectives Submitted")
+history = erp.list_performance_reviews(employee_id="E-2043")   # newest cycle first
 ```
 
 To point at a different environment (real ERP, staging, etc.):
@@ -358,7 +534,7 @@ or `ERPClient(base_url="https://real-erp.company.com/api")` explicitly.
 
 1. Add `db/schema_expenses.sql` + a `scripts/build_expenses.py` seeder (call it after `build_employees.py`, same pattern as `build_finance.py`).
 2. Add `app/schemas/expenses.py` (Pydantic models).
-3. Add `app/routers/expenses.py` (endpoints), same CRUD pattern as `employees.py`/`finance.py`.
+3. Add `app/routers/expenses.py` (endpoints), same CRUD pattern as `employees.py`/`finance.py` — or, if the module has an approval workflow, the state-machine pattern in `performance.py` (status guards + action endpoints, never a caller-settable status).
 4. Register it in `app/main.py`: `app.include_router(expenses.router)`.
 5. Add corresponding methods to `erp_client.py` under a `# ---- Expenses module ----` section.
 6. Add the new seed script to `entrypoint.sh`'s seeding block.
