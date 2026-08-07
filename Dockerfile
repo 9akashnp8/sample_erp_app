@@ -3,9 +3,25 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Trust the corporate proxy's CA so pip can reach PyPI through TLS inspection.
+COPY certs/cpc-ca01.crt /usr/local/share/ca-certificates/cpc-ca01.crt
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
 # Install dependencies first for better layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The corporate proxy's TLS chain includes a weak (sub-2048-bit) key that
+# OpenSSL 3.x rejects outright regardless of CA trust, and the network team
+# has confirmed it can't be strengthened — so we skip verification for pip's
+# own hosts specifically rather than weakening TLS for the whole image.
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org \
+    --trusted-host files.pythonhosted.org \
+    --trusted-host pypi.python.org \
+    -r requirements.txt
 
 # Copy application code
 COPY app/ ./app/
