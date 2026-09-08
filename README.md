@@ -109,6 +109,36 @@ uvicorn app.main:app --reload --port 8000
 
 Interactive API docs: http://localhost:8000/docs
 
+### Windows (no Docker, no Postgres needed)
+
+The app is backed by SQLite (`app/database.py`), not Postgres — a local
+Postgres server, if you have one running, is not used by anything here.
+`entrypoint.sh` and the volume mounts in `docker-compose.yml` are
+Docker-only conveniences; running natively just means doing what that
+script does, by hand, in PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe scripts\build_employees.py
+.venv\Scripts\python.exe scripts\build_finance.py
+.venv\Scripts\python.exe scripts\build_helpdesk.py
+.venv\Scripts\python.exe scripts\build_leave.py
+.venv\Scripts\python.exe scripts\build_performance.py
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+```
+
+On a network with TLS-inspecting proxies, `pip install` may need to trust
+the proxy's own hosts explicitly (the same issue the Dockerfile works
+around by installing a corporate CA):
+
+```powershell
+.venv\Scripts\python.exe -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org -r requirements.txt
+```
+
+To reseed later, re-run the `build_*.py` scripts (they drop and recreate
+their own tables) or just delete `db\erp.db` and run all five again.
+
 
 ## Employee table
 
