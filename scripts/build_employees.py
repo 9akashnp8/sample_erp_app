@@ -20,7 +20,7 @@ def build():
 
     # Drop and recreate for a clean seed
     cur.execute("DROP TABLE IF EXISTS employees")
-    with open(SCHEMA_PATH) as f:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
         cur.executescript(f.read())
 
     # (employee_id, first, last, email, title, department, manager_id, emp_type, status, hire_date, term_date, location, phone)

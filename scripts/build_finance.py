@@ -27,7 +27,7 @@ def build():
     cur.execute("DROP TABLE IF EXISTS payslips")
     cur.execute("DROP TABLE IF EXISTS salary_info")
     cur.execute("DROP TABLE IF EXISTS bank_accounts")
-    with open(SCHEMA_PATH) as f:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
         cur.executescript(f.read())
 
     # Sanity check: employees table must already exist and be populated

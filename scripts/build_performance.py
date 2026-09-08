@@ -265,7 +265,7 @@ def build():
     cur.execute("DROP TABLE IF EXISTS performance_objectives")
     cur.execute("DROP TABLE IF EXISTS performance_reviews")
     cur.execute("DROP TABLE IF EXISTS competencies")
-    with open(SCHEMA_PATH) as f:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
         cur.executescript(f.read())
 
     # Sanity check: employees table must already exist and be populated

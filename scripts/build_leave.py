@@ -18,7 +18,7 @@ def build():
     cur = conn.cursor()
 
     cur.execute("DROP TABLE IF EXISTS leave_requests")
-    with open(SCHEMA_PATH) as f:
+    with open(SCHEMA_PATH, encoding="utf-8") as f:
         cur.executescript(f.read())
 
     # Sanity check: employees table must already exist and be populated
