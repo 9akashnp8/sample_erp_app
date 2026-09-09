@@ -12,23 +12,27 @@ erp_app/
 ├── app/
 │   ├── main.py                # FastAPI entrypoint — register new module routers here
 │   ├── database.py            # sqlite3 connection helper
+│   ├── pdf_writer.py          # tiny stdlib-only PDF writer (issued letters)
 │   ├── routers/
 │   │   ├── employees.py       # /employees endpoints
 │   │   ├── finance.py         # /finance endpoints (bank accounts, salary, payslips)
 │   │   ├── helpdesk.py        # /tickets endpoints + outbound webhook dispatch
 │   │   ├── leave.py           # /leave-requests endpoints
+│   │   ├── letters.py         # /letters endpoints (For Whom It May Concern requests + PDF)
 │   │   └── performance.py     # /performance endpoints (review workflow, objectives, appraisals)
 │   └── schemas/
 │       ├── employee.py        # Pydantic request/response models
 │       ├── finance.py         # Pydantic request/response models
 │       ├── helpdesk.py        # Pydantic request/response models
 │       ├── leave.py           # Pydantic request/response models
+│       ├── letters.py         # Pydantic request/response models
 │       └── performance.py     # Pydantic request/response models
 ├── db/
 │   ├── schema_employees.sql   # employees table DDL
 │   ├── schema_finance.sql     # bank_accounts / salary_info / payslips DDL
 │   ├── schema_helpdesk.sql    # tickets table DDL
 │   ├── schema_leave.sql       # leave_requests table DDL
+│   ├── schema_letters.sql     # letter_requests table DDL
 │   ├── schema_performance.sql # competencies / performance_reviews / objectives / competency ratings DDL
 │   └── erp.db                 # generated SQLite file (gitignore this)
 ├── scripts/
@@ -36,6 +40,7 @@ erp_app/
 │   ├── build_finance.py       # (re)creates + seeds finance tables (run after build_employees.py)
 │   ├── build_helpdesk.py      # (re)creates + seeds tickets (run after build_employees.py)
 │   ├── build_leave.py         # (re)creates + seeds leave requests (run after build_employees.py)
+│   ├── build_letters.py       # (re)creates + seeds letter requests (run after build_finance.py)
 │   └── build_performance.py   # (re)creates + seeds performance reviews (run after build_employees.py)
 ├── erp_client.py              # <-- agents import THIS, not the DB or routers
 ├── Dockerfile
@@ -103,6 +108,7 @@ python scripts/build_employees.py     # builds db/erp.db with 15 seed employees
 python scripts/build_finance.py       # seeds bank accounts, salary, payslips (run after the above)
 python scripts/build_helpdesk.py      # seeds tickets (run after the above)
 python scripts/build_leave.py         # seeds leave requests (run after the above; finance depends on this for payslip generation)
+python scripts/build_letters.py       # seeds letter requests (run after the above; issued letters snapshot salary/bank data)
 python scripts/build_performance.py   # seeds competencies + performance reviews (run after the above)
 uvicorn app.main:app --reload --port 8000
 ```
@@ -347,6 +353,112 @@ Business rules enforced by the API:
 - `days` is never caller-supplied — always computed server-side from
   `start_date`/`end_date`, and recomputed on any `PATCH` that changes either.
 
+## Letters & certificates module
+
+The self-service side of an HR portal: an employee requests an official
+letter, HR issues it, and a formatted PDF comes back. One document type is
+modeled so far — **For Whom It May Concern**.
+
+`letter_requests`: `id, request_ref (unique, server-generated e.g. LC-000012),
+employee_id (FK -> employees), letter_type, include_salary,
+include_bank_details, addressed_to, purpose, status
+(Pending/Issued/Rejected/Cancelled), decision_notes, document_ref (assigned at
+issue), issued_at, snapshot_* (13 columns, frozen at issue), created_at,
+updated_at`.
+
+### The three variants
+
+What goes in the letter is the whole point of the feature:
+
+| `include_salary` | `include_bank_details` | The letter says |
+|---|---|---|
+| `false` | `false` | Employment only — name, employee id, job title, department, hire date, employment type |
+| `true`  | `false` | ...plus the gross salary, currency and pay frequency, read from `salary_info` |
+| `true`  | `true`  | ...plus the bank account the salary is credited to, read from `bank_accounts` |
+
+`include_bank_details` without `include_salary` is a **422** — the bank
+paragraph exists to say where *that salary* is credited, and the real ERP's
+form gates the bank checkbox behind the salary one. It's enforced three
+times over (Pydantic validator, a router check on `PATCH`, and a `CHECK`
+constraint in the DDL) so no path can write the combination.
+
+### Workflow
+
+```
+                         ┌── issue ──► Issued ──► PDF available at .../document
+Pending (on create) ─────┼── reject ─► Rejected  (reason required)
+                         └── cancel ─► Cancelled (employee withdraws)
+```
+
+`status` is never caller-settable — same rule as tickets and performance
+reviews, the opposite of leave requests. Every action requires `Pending` and
+returns **409** from anywhere else; there is no un-issue, because once a
+letter exists it has left the building.
+
+**Issuing is what creates the document.** At that moment the employee's
+details (plus salary/bank, if requested) are snapshotted onto the request and
+a `document_ref` is assigned. The PDF is then rendered *on demand from that
+snapshot*, never stored and never re-read from live tables — so a raise, a
+promotion or a new bank account after issue does not silently change a letter
+that has already been handed to an embassy. Same reasoning as
+`payslips.gross_salary`, and easy to see for yourself:
+
+```python
+letter = erp.get_letter_content(ref)      # salary: 11200
+erp.update_salary_info("E-2043", gross_salary=99999)
+erp.get_letter_content(ref)               # still 11200
+```
+
+### The PDF
+
+`app/pdf_writer.py` is a ~150-line stdlib-only PDF writer — no reportlab, no
+new dependency, and requirements.txt still has three lines. It produces a real
+single- (or multi-) page PDF using the base-14 Helvetica faces, which every
+reader ships, so nothing is embedded. Text is WinAnsi (cp1252) encoded, so
+Latin-1 names and addressees (`Ausländerbehörde Berlin`) print correctly.
+
+Two ways to read an issued letter, both built from the same composed
+document so they can't drift:
+
+- `GET .../document` — the PDF itself (`application/pdf`, with a
+  `Content-Disposition` filename of `{document_ref}.pdf`). What the employee
+  downloads.
+- `GET .../content` — the same letter as JSON: every field plus `body`, the
+  paragraphs verbatim. **Agents should read this one** rather than parsing PDF
+  bytes.
+
+| Method | Path                                       | Purpose |
+|--------|--------------------------------------------|---------|
+| GET    | `/letters/requests`                        | List/search — filters: `employee_id`, `status`, `letter_type` |
+| GET    | `/letters/requests/{request_ref}`          | Fetch one request |
+| POST   | `/letters/requests`                        | Submit a request (always created `Pending`) |
+| PATCH  | `/letters/requests/{request_ref}`          | Amend a `Pending` request (409 afterwards) |
+| POST   | `/letters/requests/{request_ref}/issue`    | HR — snapshot the details, assign `document_ref`, mark `Issued` |
+| POST   | `/letters/requests/{request_ref}/reject`   | HR — decline (`reason` required) |
+| POST   | `/letters/requests/{request_ref}/cancel`   | Employee — withdraw a `Pending` request |
+| GET    | `/letters/requests/{request_ref}/content`  | The issued letter as JSON (fields + paragraphs) |
+| GET    | `/letters/requests/{request_ref}/document` | The issued letter as a PDF |
+| DELETE | `/letters/requests/{request_ref}`          | Hard delete (test cleanup) |
+
+Business rules enforced by the API:
+- Unknown `employee_id` → 404. `employee_id` and `letter_type` are immutable
+  after creation — re-request rather than mutating what was asked for.
+- A **`Terminated` employee → 400**, on create and on issue. This letter
+  certifies *current* employment; what a leaver needs is an experience letter,
+  which this module doesn't model yet. (`E-1755` in the seed data is the case
+  to test against.) `On Leave` employees are fine.
+- Issuing a letter whose data isn't there → 400: `include_salary` with no
+  `salary_info` row, or `include_bank_details` with no `Active` bank account.
+  The primary account is used when there's more than one.
+- The letter prints the **masked** account number (`****4820`), because this
+  app never exposes a full one (see the Finance module). A real letter would
+  print the full number — that's the mock-only difference to swap out.
+
+Seed data: 11 requests across all four statuses and all three variants,
+including two issued letters for `E-2043`. Currency and Latin-1 coverage come
+along for free from the finance seed — `E-3320` is a `EUR` salary addressed to
+a German authority, `E-1902` is `GBP`.
+
 ## Performance management module
 
 Four tables: `competencies` (pre-defined company core competencies — read-only
@@ -514,6 +626,23 @@ payslip = erp.generate_payslip("E-2043", period_month=7, period_year=2026)
 # payslip["net_pay"] is lower than a period with no unpaid leave.
 leave_history = erp.list_leave_requests(employee_id="E-2043", period_year=2026, period_month=7)
 
+# Letters & certificates — request a "For Whom It May Concern" letter, get a PDF
+req = erp.request_letter("E-2043", include_salary=True, include_bank_details=True,
+                          addressed_to="The Consulate General of Canada",
+                          purpose="a work visa application")
+ref = req["request_ref"]                                       # "LC-000012", status "Pending"
+
+erp.issue_letter_request(ref, notes="Checked against passport name.")
+letter = erp.get_letter_content(ref)                           # fields + the exact paragraphs
+letter["salary"]["gross_salary"]                               # frozen at issue, not live
+erp.download_letter_document(ref, save_to="fwimc.pdf")         # the PDF the employee gets
+
+# The plain variant (no salary, no bank) and the HR side of the workflow
+plain = erp.request_letter("E-1187", purpose="a rental application")
+erp.reject_letter_request(plain["request_ref"], "Please request this through your manager.")
+queue = erp.list_letter_requests(status="Pending")             # HR's action queue
+history = erp.list_letter_requests(employee_id="E-2043")       # newest first
+
 # Performance management — a full cycle, both phases
 review = erp.create_performance_review("E-2043", cycle_year=2027)
 ref = review["review_ref"]                                     # "PR-2027-E2043"
@@ -564,7 +693,7 @@ or `ERPClient(base_url="https://real-erp.company.com/api")` explicitly.
 
 1. Add `db/schema_expenses.sql` + a `scripts/build_expenses.py` seeder (call it after `build_employees.py`, same pattern as `build_finance.py`).
 2. Add `app/schemas/expenses.py` (Pydantic models).
-3. Add `app/routers/expenses.py` (endpoints), same CRUD pattern as `employees.py`/`finance.py` — or, if the module has an approval workflow, the state-machine pattern in `performance.py` (status guards + action endpoints, never a caller-settable status).
+3. Add `app/routers/expenses.py` (endpoints), same CRUD pattern as `employees.py`/`finance.py` — or, if the module has an approval workflow, the state-machine pattern in `performance.py` (status guards + action endpoints, never a caller-settable status); `letters.py` is the short version of the same thing.
 4. Register it in `app/main.py`: `app.include_router(expenses.router)`.
 5. Add corresponding methods to `erp_client.py` under a `# ---- Expenses module ----` section.
 6. Add the new seed script to `entrypoint.sh`'s seeding block.

@@ -32,7 +32,9 @@ class ERPClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def _request(self, method: str, path: str, **kwargs) -> Any:
+    def _send(self, method: str, path: str, **kwargs):
+        """Issue the call and turn any error status into an ERPClientError.
+        Shared by the JSON and binary paths — an error body is JSON either way."""
         url = f"{self.base_url}{path}"
         resp = requests.request(method, url, timeout=self.timeout, **kwargs)
         if resp.status_code >= 400:
@@ -41,9 +43,18 @@ class ERPClient:
             except ValueError:
                 detail = resp.text
             raise ERPClientError(resp.status_code, detail)
+        return resp
+
+    def _request(self, method: str, path: str, **kwargs) -> Any:
+        resp = self._send(method, path, **kwargs)
         if resp.status_code == 204:
             return None
         return resp.json()
+
+    def _request_bytes(self, method: str, path: str, **kwargs) -> bytes:
+        """For endpoints that return a file rather than JSON — currently only
+        the issued letter PDF."""
+        return self._send(method, path, **kwargs).content
 
     # ---------- Employee module ----------
 
@@ -262,6 +273,84 @@ class ERPClient:
     def delete_leave_request(self, leave_id: str) -> None:
         """Hard delete — mainly for test cleanup."""
         self._request("DELETE", f"/leave-requests/{leave_id}")
+
+    # ---------- Letters & certificates module ----------
+
+    def request_letter(self, employee_id: str, include_salary: bool = False,
+                        include_bank_details: bool = False,
+                        addressed_to: Optional[str] = None,
+                        purpose: Optional[str] = None,
+                        letter_type: str = "For Whom It May Concern") -> Dict[str, Any]:
+        """Submit a 'For Whom It May Concern' request from self-service. Always
+        comes back Pending — HR still has to issue it before there is a PDF.
+
+        The three variants are: plain (neither flag), with salary
+        (include_salary), and with salary + bank details (both).
+        include_bank_details alone is a 422 — the bank paragraph exists to say
+        where the salary is credited."""
+        payload = {
+            "employee_id": employee_id, "letter_type": letter_type,
+            "include_salary": include_salary, "include_bank_details": include_bank_details,
+            "addressed_to": addressed_to, "purpose": purpose,
+        }
+        return self._request("POST", "/letters/requests", json=payload)
+
+    def get_letter_request(self, request_ref: str) -> Dict[str, Any]:
+        """Fetch a single letter request by its request_ref, e.g. 'LC-000012'."""
+        return self._request("GET", f"/letters/requests/{request_ref}")
+
+    def list_letter_requests(self, employee_id: Optional[str] = None,
+                              status: Optional[str] = None,
+                              letter_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List/search letter requests — an employee's own history, or HR's
+        queue (status='Pending'). Newest first."""
+        params = {k: v for k, v in {
+            "employee_id": employee_id, "status": status, "letter_type": letter_type,
+        }.items() if v is not None}
+        return self._request("GET", "/letters/requests", params=params)
+
+    def update_letter_request(self, request_ref: str, **fields) -> Dict[str, Any]:
+        """Amend a still-Pending request, e.g.
+        update_letter_request('LC-000012', include_salary=True). 409 once the
+        request has been issued/rejected/cancelled."""
+        return self._request("PATCH", f"/letters/requests/{request_ref}", json=fields)
+
+    def issue_letter_request(self, request_ref: str,
+                              notes: Optional[str] = None) -> Dict[str, Any]:
+        """HR action — issue the letter. This snapshots the employee's details
+        (plus salary/bank if requested) onto the request and assigns a
+        document_ref; the PDF is available from that point on. Fails with 400
+        if the letter asks for salary/bank data the employee doesn't have."""
+        return self._request("POST", f"/letters/requests/{request_ref}/issue",
+                             json={"notes": notes})
+
+    def reject_letter_request(self, request_ref: str, reason: str) -> Dict[str, Any]:
+        """HR action — decline the request. `reason` is required."""
+        return self._request("POST", f"/letters/requests/{request_ref}/reject",
+                             json={"reason": reason})
+
+    def cancel_letter_request(self, request_ref: str) -> Dict[str, Any]:
+        """Employee action — withdraw a request HR hasn't acted on yet."""
+        return self._request("POST", f"/letters/requests/{request_ref}/cancel")
+
+    def get_letter_content(self, request_ref: str) -> Dict[str, Any]:
+        """The issued letter as structured JSON — the same fields and
+        paragraphs the PDF prints. Read this rather than parsing the PDF."""
+        return self._request("GET", f"/letters/requests/{request_ref}/content")
+
+    def download_letter_document(self, request_ref: str,
+                                  save_to: Optional[str] = None) -> bytes:
+        """Download the issued letter's PDF, optionally writing it to `save_to`.
+        Returns the raw bytes either way. 409 unless the request is Issued."""
+        content = self._request_bytes("GET", f"/letters/requests/{request_ref}/document")
+        if save_to:
+            with open(save_to, "wb") as f:
+                f.write(content)
+        return content
+
+    def delete_letter_request(self, request_ref: str) -> None:
+        """Hard delete — mainly for test cleanup. Prefer cancel/reject."""
+        self._request("DELETE", f"/letters/requests/{request_ref}")
 
     # ---------- Performance management module ----------
 
