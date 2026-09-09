@@ -14,7 +14,7 @@ should stay stable.
 """
 from fastapi import FastAPI
 
-from app.routers import employees, finance, helpdesk, leave, performance
+from app.routers import employees, finance, helpdesk, leave, letters, performance
 
 app = FastAPI(
     title="Sample ERP API",
@@ -26,6 +26,7 @@ app.include_router(employees.router)
 app.include_router(finance.router)
 app.include_router(helpdesk.router)
 app.include_router(leave.router)
+app.include_router(letters.router)
 app.include_router(performance.router)
 
 

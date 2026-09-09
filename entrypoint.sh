@@ -10,6 +10,7 @@ if [ ! -f "$DB_PATH" ] || [ "$RESET_DB" = "1" ]; then
     python scripts/build_finance.py
     python scripts/build_helpdesk.py
     python scripts/build_leave.py
+    python scripts/build_letters.py
     python scripts/build_performance.py
 else
     echo "Existing database found at $DB_PATH — skipping seed (set RESET_DB=1 to force reseed)."
